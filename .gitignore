@@ -1,0 +1,20 @@
+# Signing material — never commit a keystore or its passwords
+*.keystore
+*.jks
+keystore.properties
+notes/
+
+# Build outputs
+*.apk
+*.idsig
+out/
+build-tmp/
+engine-classes/
+gen/
+
+# On-device learning data and personal rule packs — never commit.
+# The engine learns on the phone into cnd_learn.txt (app-private storage);
+# a personal rule pack is data about a person's life, not source code.
+cnd_learn.txt
+personal-pack*
+*.personal.*
