@@ -27,6 +27,7 @@ import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowInsets;
@@ -119,22 +120,35 @@ public class CodeNDriveService extends InputMethodService {
     private boolean listening = false;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
-    // ---------------- v3.4 ClickSend ----------------
-    // Hands-free send: three tongue clicks while dictation is armed fire
-    // the existing enter/send path after a cancellable 2s countdown.
-    // A parallel AudioRecord feeds ClickDetector the same mic signal the
-    // recognizer hears (SpeechRecognizer's onRmsChanged is too coarse —
-    // its cadence cannot resolve the 85-110ms gaps between clicks).
-    // Armed only from a mic tap; never an always-on mic.
+    // ---------------- ClickSend (inherited v3.4; v1.0.2 shape) ----------------
+    // Hands-free send: three tongue clicks after a dictation fire the
+    // enter/send path. A parallel AudioRecord feeds ClickDetector
+    // (SpeechRecognizer's onRmsChanged is too coarse — its cadence
+    // cannot resolve the 85-110ms gaps between clicks).
+    // v1.0.2 changes, both at James's word / from his phone reports
+    // (identical to James Keyboard v3.4.2):
+    //  - NO countdown (James, 2026-11-11: "As soon as it hears the
+    //    three clicks, send it"). The triple IS the send; there is no
+    //    cancel window. A false triple = an instant send — accepted.
+    //  - The recorder starts only AFTER the recognition result returns
+    //    (it covers the grace window, which is when the send-triple
+    //    happens). Previously it ran DURING recognition — a second
+    //    VOICE_RECOGNITION capture fighting the recognizer for the mic,
+    //    James's dictation-latency regression. It never runs while the
+    //    recognizer is live now, so a triple-click can no longer cancel
+    //    a live recognition; the mic key remains the mid-dictation stop.
     private ClickDetector clickDetector;
     private AudioRecord clickRec;
     private volatile boolean clickWatchOn = false;
-    private boolean clickCountingDown = false;
-    private long clickCancelArmedAtMs = 0;
     private ToneGenerator toneGen;
     private boolean clickDeafNoted = false;
     private float rmsSessionMin = Float.MAX_VALUE;
     private float rmsSessionMax = -Float.MAX_VALUE;
+    // RMS swing of the recognition session that just ended, captured in
+    // armClickGrace BEFORE startClickWatch resets the accumulators —
+    // the deaf-stream check compares it against what the recorder
+    // heard across the grace window.
+    private float lastRecognizerSwingDb = 0f;
 
     private final ClickDetector.Listener clickListener = new ClickDetector.Listener() {
         @Override public void onTripleClick() {
@@ -151,21 +165,25 @@ public class CodeNDriveService extends InputMethodService {
 
     private final Runnable clickGraceStop = new Runnable() {
         @Override public void run() {
+            // The grace window expired unused — this is where the
+            // deaf-stream check now runs (v1.0.2): the recognizer
+            // clearly heard the dictation, so if the recorder heard
+            // literally nothing across the whole window, its stream is
+            // being starved on this phone. (Previously the check ran 3s
+            // into the watch, comparing simultaneous captures — a
+            // premise the post-result recorder start removed.)
+            boolean deaf = clickWatchOn && !clickDeafNoted
+                    && clickDetector != null
+                    && lastRecognizerSwingDb > 5f
+                    && clickDetector.getMaxFrameRms() < ClickDetector.ABS_MIN_RMS;
             stopClickWatch();
-            if (!clickCountingDown) refreshRestingStrip();
-        }
-    };
-
-    private final Runnable clickTick1 = new Runnable() {
-        @Override public void run() {
-            if (clickCountingDown) {
-                setStripStatus("Sending in 1 \u2014 click or tap any key to cancel");
+            if (deaf) {
+                clickDeafNoted = true;
+                setStripStatus("Click\u00d73 send can\u2019t hear the mic on this phone \u2014 dictation unaffected.");
+            } else {
+                refreshRestingStrip();
             }
         }
-    };
-
-    private final Runnable clickFire = new Runnable() {
-        @Override public void run() { completeClickSend(); }
     };
 
     // ---------------- CodeNDrive modes ----------------
@@ -638,25 +656,64 @@ public class CodeNDriveService extends InputMethodService {
     }
 
     private void onEnterKey() {
-        // ClickSend countdown running + enter tapped = "send now", via
-        // this same path (completeClickSend re-enters here with the
-        // countdown flag already cleared).
-        if (clickCountingDown) { completeClickSend(); return; }
+        // v1.0.2: there is no ClickSend countdown anymore (James's
+        // ruling — the triple-click IS the send), so a tapped enter and
+        // a ClickSend completion are the same thing by construction:
+        // both land here and run the send chain below.
         clearBoundarySuggestions(); // the fix below may set fresh state
         fixWordBeforeCursor();
         // Commit boundary: the field's final text is what gets learned.
         observeCommittedDelta();
         InputConnection ic = getCurrentInputConnection();
         if (ic == null) return;
-        EditorInfo info = getCurrentInputEditorInfo();
-        int action = info != null ? (info.imeOptions & EditorInfo.IME_MASK_ACTION) : 0;
-        if (action != EditorInfo.IME_ACTION_NONE
-                && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
-            ic.performEditorAction(action);
-        } else {
-            ic.commitText("\n", 1);
-        }
+        performSendAction(ic, getCurrentInputEditorInfo());
         afterCommit();
+    }
+
+    /**
+     * v1.0.2 send chain (Defect 1: ClickSend fired but the message never
+     * sent). The pre-1.0.2 path made ONE attempt — performEditorAction
+     * with the imeOptions action, its boolean result ignored — and when
+     * the editor declared no action it committed "\n", which a
+     * single-line compose box silently swallows: the dictated text sat
+     * in the box and nothing was ever sent. Now walk SendPlan's order
+     * and stop at the first attempt the editor accepts:
+     *   1. performEditorAction(EditorInfo.actionId) when the editor set
+     *      a custom action id (editors that expose send only that way).
+     *   2. performEditorAction(imeOptions action) — SEND/GO/DONE/etc.
+     *   3. A raw KEYCODE_ENTER key event — compose boxes that declare
+     *      IME_ACTION_NONE/unspecified but send on the Enter key.
+     *   4. commitText("\n") — the old terminal fallback, kept for
+     *      plain/multiline editors where enter means newline.
+     */
+    private void performSendAction(InputConnection ic, EditorInfo info) {
+        int actionId = info != null ? info.actionId : 0;
+        int imeAction = info != null
+                ? (info.imeOptions & EditorInfo.IME_MASK_ACTION) : 0;
+        for (int attempt : SendPlan.plan(actionId, imeAction)) {
+            boolean handled;
+            switch (attempt) {
+                case SendPlan.ATTEMPT_ACTION_ID:
+                    handled = ic.performEditorAction(actionId);
+                    break;
+                case SendPlan.ATTEMPT_IME_ACTION:
+                    handled = ic.performEditorAction(imeAction);
+                    break;
+                case SendPlan.ATTEMPT_KEY_EVENT: {
+                    long t = SystemClock.uptimeMillis();
+                    boolean down = ic.sendKeyEvent(new KeyEvent(t, t,
+                            KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER, 0));
+                    boolean up = ic.sendKeyEvent(new KeyEvent(t, t,
+                            KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER, 0));
+                    handled = down || up;
+                    break;
+                }
+                default: // ATTEMPT_NEWLINE
+                    handled = ic.commitText("\n", 1);
+                    break;
+            }
+            if (handled) return;
+        }
     }
 
     private void attachBackspace(Button b) {
@@ -903,7 +960,7 @@ public class CodeNDriveService extends InputMethodService {
                 b.setVisibility(View.GONE);
             }
         }
-        if (!listening && !clickCountingDown) refreshRestingStrip();
+        if (!listening) refreshRestingStrip();
     }
 
     private void pickSuggestion(int idx) {
@@ -991,26 +1048,46 @@ public class CodeNDriveService extends InputMethodService {
             if (clip == null || clip.getItemCount() == 0) return;
             ClipDescription desc = clip.getDescription();
             pendingClipDesc = desc;
-            boolean descIsImage = false;
+            String[] descMimes = null;
             if (desc != null) {
-                for (int i = 0; i < desc.getMimeTypeCount(); i++) {
-                    String m = desc.getMimeType(i);
-                    if (m != null && m.startsWith("image/")) { descIsImage = true; break; }
+                descMimes = new String[desc.getMimeTypeCount()];
+                for (int i = 0; i < descMimes.length; i++) {
+                    descMimes[i] = desc.getMimeType(i);
                 }
             }
-            ClipData.Item item = clip.getItemAt(0);
-            Uri uri = item.getUri();
-            CharSequence text = item.getText();
-            if (uri != null && (descIsImage || text == null)) {
-                pendingClipUri = uri; // image clip (e.g. a screenshot)
-            } else if (text != null) {
-                pendingClipText = text.toString();
-            } else if (uri != null) {
-                pendingClipUri = uri;
-            } else {
-                // Structured text (HTML/intent clips): coerce as a last resort.
-                CharSequence coerced = item.coerceToText(this);
-                if (coerced != null && coerced.length() > 0) pendingClipText = coerced.toString();
+            boolean descIsImage = ClipScan.descHasImage(descMimes);
+            // v1.0.2 (Defect 2): scan ALL items, not just item 0. The
+            // pre-1.0.2 read looked only at item 0, so a clip whose
+            // image sits behind a text item (the usual shape of a
+            // browser/gallery "copy image": text or filename first,
+            // image Uri second) never surfaced the image at all — the
+            // panel showed the text, or nothing, and the held image
+            // simply had no paste. Classification lives in ClipScan.
+            int n = clip.getItemCount();
+            boolean[] hasUri = new boolean[n];
+            boolean[] hasText = new boolean[n];
+            for (int i = 0; i < n; i++) {
+                ClipData.Item it = clip.getItemAt(i);
+                hasUri[i] = it.getUri() != null;
+                hasText[i] = it.getText() != null;
+            }
+            int imageItem = ClipScan.findImageItem(hasUri, hasText, descIsImage);
+            int textItem = ClipScan.findTextItem(hasText);
+            if (imageItem >= 0) {
+                pendingClipUri = clip.getItemAt(imageItem).getUri();
+            }
+            // The image item's own text is usually just its label or
+            // filename — not a separate text clip worth its own entry.
+            if (textItem >= 0 && textItem != imageItem) {
+                pendingClipText = clip.getItemAt(textItem).getText().toString();
+            }
+            if (pendingClipUri == null && pendingClipText == null) {
+                // Structured text (HTML/intent clips): coerce item 0
+                // as a last resort, as before.
+                CharSequence coerced = clip.getItemAt(0).coerceToText(this);
+                if (coerced != null && coerced.length() > 0) {
+                    pendingClipText = coerced.toString();
+                }
             }
         } catch (Exception e) {
             pendingClipText = null;
@@ -1053,21 +1130,21 @@ public class CodeNDriveService extends InputMethodService {
         top.addView(title, new LinearLayout.LayoutParams(0, dp(52), 2f));
         keysBox.addView(top);
 
-        if (pendingClipText != null && !pendingClipText.isEmpty()) {
-            String oneLine = pendingClipText.replace('\n', ' ').replace('\r', ' ');
-            if (oneLine.length() > 90) oneLine = oneLine.substring(0, 90) + "…";
-            Button paste = new Button(this);
-            styleKey(paste);
-            paste.setTextSize(14);
-            paste.setText("📋 " + oneLine);
-            paste.setOnClickListener(v -> pasteClipText());
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
-            lp.setMargins(dp(2), dp(3), dp(2), dp(3));
-            keysBox.addView(paste, lp);
-        } else if (pendingClipUri != null) {
+        // v1.0.2: the image entry goes at the TOP whenever the clip
+        // holds an image, and a text entry (when the clip carries a
+        // separate text item too) sits below it — the panel is no
+        // longer either/or.
+        boolean showedEntry = false;
+        if (pendingClipUri != null) {
+            showedEntry = true;
             Bitmap thumb = decodeClipThumbnail(pendingClipUri);
             if (thumb != null) {
+                TextView label = new TextView(this);
+                label.setText("Paste image");
+                label.setTextColor(Color.rgb(170, 178, 190));
+                label.setTextSize(13);
+                label.setGravity(Gravity.CENTER);
+                keysBox.addView(label);
                 ImageView iv = new ImageView(this);
                 iv.setImageBitmap(thumb);
                 iv.setAdjustViewBounds(true);
@@ -1090,14 +1167,29 @@ public class CodeNDriveService extends InputMethodService {
                 Button paste = new Button(this);
                 styleKey(paste);
                 paste.setTextSize(14);
-                paste.setText("🖼 Image — tap to paste");
+                paste.setText("🖼 Paste image — tap to paste");
                 paste.setOnClickListener(v -> pasteClipImage());
                 LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
                 lp.setMargins(dp(2), dp(3), dp(2), dp(3));
                 keysBox.addView(paste, lp);
             }
-        } else {
+        }
+        if (pendingClipText != null && !pendingClipText.isEmpty()) {
+            showedEntry = true;
+            String oneLine = pendingClipText.replace('\n', ' ').replace('\r', ' ');
+            if (oneLine.length() > 90) oneLine = oneLine.substring(0, 90) + "…";
+            Button paste = new Button(this);
+            styleKey(paste);
+            paste.setTextSize(14);
+            paste.setText("📋 " + oneLine);
+            paste.setOnClickListener(v -> pasteClipText());
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
+            lp.setMargins(dp(2), dp(3), dp(2), dp(3));
+            keysBox.addView(paste, lp);
+        }
+        if (!showedEntry) {
             TextView empty = new TextView(this);
             empty.setText("Clipboard is empty");
             empty.setTextColor(Color.rgb(170, 178, 190));
@@ -1181,18 +1273,9 @@ public class CodeNDriveService extends InputMethodService {
         if (uri == null) return;
         EditorInfo ei = getCurrentInputEditorInfo();
         String[] mimes = ei != null ? ei.contentMimeTypes : null;
-        if (mimes != null) {
-            boolean supportsImage = false;
-            for (String m : mimes) {
-                if (m != null && (m.equals("image/*") || m.startsWith("image/"))) {
-                    supportsImage = true;
-                    break;
-                }
-            }
-            if (!supportsImage) {
-                setStripStatus("This app doesn't accept pasted images");
-                return; // panel stays open; the refusal is the visible outcome
-            }
+        if (mimes != null && !ClipScan.editorAcceptsImage(mimes)) {
+            setStripStatus("This app doesn't accept pasted images");
+            return; // panel stays open; the refusal is the visible outcome
         }
         InputConnection ic = getCurrentInputConnection();
         if (ic == null) {
@@ -1205,6 +1288,13 @@ public class CodeNDriveService extends InputMethodService {
             ClipDescription desc = pendingClipDesc != null ? pendingClipDesc
                     : new ClipDescription("Image", new String[]{"image/*"});
             InputContentInfo info = new InputContentInfo(uri, desc);
+            // v1.0.2: claim OUR read access to the clip Uri first. The
+            // pre-1.0.2 code skipped this, so for clips whose provider
+            // had not already granted this IME access, the thumbnail
+            // decode and the commit could both fail even in editors
+            // that accept images. (The GRANT flag below then passes
+            // read access on to the target app.)
+            try { info.requestPermission(); } catch (Exception ignored) { }
             ok = ic.commitContent(info,
                     InputConnection.INPUT_CONTENT_GRANT_READ_URI_PERMISSION, null);
         } catch (Exception e) {
@@ -1231,9 +1321,10 @@ public class CodeNDriveService extends InputMethodService {
 
     // ---------------- v3.4 ClickSend machinery ----------------
 
-    /** Start the parallel capture + detector. Recognizer starts first, so
-     *  on devices that feed only one capture, dictation wins and this
-     *  degrades silently (see the deaf check) instead of breaking voice. */
+    /** Start the capture + detector. v1.0.2: called only from
+     *  armClickGrace, i.e. AFTER the recognition result has returned —
+     *  the recorder never runs while the recognizer is live (that
+     *  concurrency was the dictation-latency regression). */
     private void startClickWatch() {
         ui.removeCallbacks(clickGraceStop);
         if (clickWatchOn) return;
@@ -1273,9 +1364,9 @@ public class CodeNDriveService extends InputMethodService {
         }, "clicksend-capture");
         t.setDaemon(true);
         t.start();
-        ui.postDelayed(new Runnable() {
-            @Override public void run() { checkClickAudibility(); }
-        }, 3000);
+        // No +3s audibility probe anymore: it compared the two captures
+        // while both were live, a premise v1.0.2 removed. The deaf check
+        // now runs at grace expiry, in clickGraceStop.
     }
 
     private void runClickCapture() {
@@ -1299,9 +1390,6 @@ public class CodeNDriveService extends InputMethodService {
 
     private void stopClickWatch() {
         ui.removeCallbacks(clickGraceStop);
-        ui.removeCallbacks(clickTick1);
-        ui.removeCallbacks(clickFire);
-        clickCountingDown = false;
         if (!clickWatchOn) return;
         clickWatchOn = false;
         AudioRecord rec = clickRec;
@@ -1312,81 +1400,48 @@ public class CodeNDriveService extends InputMethodService {
         }
     }
 
-    /** Best-effort platform check: if the recognizer clearly hears sound
-     *  (its RMS swings) while our recorder has heard nothing at all, this
-     *  device is feeding the recorder silence. Say so once; dictation is
-     *  unaffected either way. */
-    private void checkClickAudibility() {
-        if (!clickWatchOn || clickDeafNoted || clickDetector == null) return;
-        boolean recognizerHears = rmsSessionMax - rmsSessionMin > 5f;
-        if (recognizerHears && clickDetector.getMaxFrameRms() < ClickDetector.ABS_MIN_RMS) {
-            clickDeafNoted = true;
-            setStripStatus("Click\u00d73 send can\u2019t hear the mic on this phone \u2014 dictation unaffected.");
-        }
-    }
-
-    /** After a result commits, the recognizer session is over — but
-     *  dictate-THEN-click is the natural order, so keep the watch armed
-     *  for a bounded grace with a strip hint. */
+    /** After a result commits, the recognizer session is over — and
+     *  dictate-THEN-click is the natural order, so the click watch
+     *  lives in this bounded grace window. v1.0.2: the watch STARTS
+     *  here (it used to start with the recognizer and run concurrently
+     *  — the latency regression). Capture the finished session's RMS
+     *  swing first: startClickWatch resets the accumulators it is
+     *  compared against at grace expiry. */
     private void armClickGrace() {
-        if (!clickWatchOn) return;
+        lastRecognizerSwingDb = rmsSessionMax > rmsSessionMin
+                ? rmsSessionMax - rmsSessionMin : 0f;
+        startClickWatch();
+        if (!clickWatchOn) return; // no permission / recorder unavailable
         setStripStatus("\ud83c\udfa4 Click \u00d73 = SEND (30s)");
         ui.removeCallbacks(clickGraceStop);
         ui.postDelayed(clickGraceStop, 30000);
     }
 
     private void onClickTripleDetected() {
-        if (clickCountingDown) return;
-        clickCountingDown = true;
-        // The clicks must never land as dictated text, and a live session
-        // must not deliver results over the send: cancel it outright.
-        if (listening && recognizer != null) {
-            try { recognizer.cancel(); } catch (Exception ignored) { }
-            listening = false;
-            if (micButton != null) micButton.setText("\ud83c\udfa4");
-        }
-        ui.removeCallbacks(clickGraceStop);
+        // v1.0.2 (James's ruling): no countdown, no cancel window — the
+        // triple IS the send, fired immediately through the shared
+        // enter/send path. The confirmation beep sounds as it fires.
+        // (The recognizer-cancel that used to live here is gone with
+        // the concurrency: the detector only runs after a result, so
+        // there is no live session for the clicks to land in.)
+        stopClickWatch(); // the send consumes the watch
         beep(ToneGenerator.TONE_PROP_BEEP, 150);
-        // The measured trailer lands ~210ms after the third click;
-        // suspend cancel-clicks briefly so it can't cancel his own send.
-        clickCancelArmedAtMs = SystemClock.uptimeMillis() + 350;
-        setStripStatus("Sending in 2 \u2014 click or tap any key to cancel");
-        ui.postDelayed(clickTick1, 1000);
-        ui.postDelayed(clickFire, 2000);
+        setStripStatus("");
+        onEnterKey();
     }
 
     private void onClickAnyDetected() {
-        if (!clickCountingDown) return;
-        if (SystemClock.uptimeMillis() < clickCancelArmedAtMs) return;
-        cancelClickSend();
+        // Single clicks have no consumer anymore: their only job was
+        // cancelling the countdown, and the countdown no longer exists.
+        // James's measured ~210ms trailer pop lands here and is
+        // ignored by design, exactly as the spec always required.
     }
 
-    private void cancelClickSend() {
-        if (!clickCountingDown) return;
-        clickCountingDown = false;
-        ui.removeCallbacks(clickTick1);
-        ui.removeCallbacks(clickFire);
-        beep(ToneGenerator.TONE_PROP_NACK, 120);
-        setStripStatus("Send cancelled \u2014 click \u00d73 to try again.");
-        if (clickDetector != null) clickDetector.reset();
-        // Re-arm the grace window so he can retry without re-dictating.
-        ui.removeCallbacks(clickGraceStop);
-        ui.postDelayed(clickGraceStop, 30000);
-    }
-
-    private void completeClickSend() {
-        if (!clickCountingDown) return;
-        clickCountingDown = false;
-        stopClickWatch();
-        setStripStatus("");
-        onEnterKey(); // the existing send/enter path — identical to the key
-    }
-
-    /** Any key tap during the countdown cancels it (the tap itself then
-     *  proceeds normally). Enter is handled separately in onEnterKey:
-     *  there, a tap during countdown means "send now". */
+    /** Kept as the key handlers' ClickSend hook. Pre-1.0.2 a tap during
+     *  the countdown cancelled the send; with the countdown removed at
+     *  James's word there is nothing to cancel, so this is deliberately
+     *  a no-op — the handlers keep their shape and the tap proceeds. */
     private void cancelCountdownOnTap() {
-        if (clickCountingDown) cancelClickSend();
     }
 
     private void beep(int tone, int ms) {
@@ -1401,7 +1456,6 @@ public class CodeNDriveService extends InputMethodService {
     // ---------------- voice ----------------
 
     private void onMicKey() {
-        if (clickCountingDown) { cancelClickSend(); return; }
         if (listening) {
             stopListening();
             stopClickWatch();
@@ -1427,9 +1481,13 @@ public class CodeNDriveService extends InputMethodService {
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
         try {
+            // v1.0.2: the click recorder must never run while the
+            // recognizer is live — stop any grace watch left over from
+            // the previous dictation, and do NOT start a new one here.
+            // The next watch starts in armClickGrace, after the result.
+            stopClickWatch();
             recognizer.startListening(intent);
             listening = true;
-            startClickWatch();
             if (micButton != null) micButton.setText("🔴");
             setStripStatus("Listening… tap 🎤 again to stop.");
         } catch (Exception e) {
@@ -1456,9 +1514,6 @@ public class CodeNDriveService extends InputMethodService {
         @Override public void onError(int error) {
             listening = false;
             if (micButton != null) micButton.setText("\ud83c\udfa4");
-            // A cancel() from ClickSend's triple lands here: while the
-            // countdown owns the strip and the watch, stay out of its way.
-            if (clickCountingDown) return;
             stopClickWatch();
             if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                 setStripStatus("Mic needs permission — open the CodeNDrive app once and tap \u201CGrant microphone\u201D.");
@@ -1470,9 +1525,6 @@ public class CodeNDriveService extends InputMethodService {
             }
         }
         @Override public void onResults(Bundle results) {
-            // Results racing in after ClickSend cancelled the session are
-            // the click segment itself — never commit them.
-            if (clickCountingDown) return;
             listening = false;
             if (micButton != null) micButton.setText("🎤");
             ArrayList<String> texts = results != null
