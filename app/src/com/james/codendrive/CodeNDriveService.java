@@ -120,6 +120,38 @@ public class CodeNDriveService extends InputMethodService {
     private boolean listening = false;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
+    // ---------------- v1.0.3 dictation patience ----------------
+    // A session is ARMED from the mic-key start until the user stops
+    // it (mic key), the keyboard goes away, a FINAL result (a
+    // non-empty onResults — it commits and ends the session, exactly
+    // as dictation always has) or a real error ends it. Timeout-type
+    // endings — ERROR_SPEECH_TIMEOUT, ERROR_NO_MATCH, an empty
+    // onResults — auto-resume while armed instead of killing the
+    // session: James (2026-11-11), "Dictation itself stops listening
+    // too soon." A streak of consecutive empty restarts is capped so
+    // the mic never hot-loops against a silent room; real speech
+    // (onBeginningOfSpeech) resets the streak.
+    private boolean dictationArmed = false;
+    private int emptyRestartCount = 0;
+    private static final int MAX_EMPTY_RESTARTS = 5;
+    private static final long RESTART_BACKOFF_MS = 400;
+    private final Runnable voiceRestart = new Runnable() {
+        @Override public void run() {
+            if (!dictationArmed || recognizer == null) return;
+            try {
+                recognizer.startListening(buildVoiceIntent());
+                listening = true;
+                if (micButton != null) micButton.setText("\uD83D\uDD34");
+                setStripStatus("Listening\u2026 tap \uD83C\uDFA4 again to stop.");
+            } catch (Exception e) {
+                dictationArmed = false;
+                listening = false;
+                if (micButton != null) micButton.setText("\uD83C\uDFA4");
+                setStripStatus("Voice failed to restart \u2014 tap \uD83C\uDFA4 to try again.");
+            }
+        }
+    };
+
     // ---------------- ClickSend (inherited v3.4; v1.0.2 shape) ----------------
     // Hands-free send: three tongue clicks after a dictation fire the
     // enter/send path. A parallel AudioRecord feeds ClickDetector
@@ -186,18 +218,13 @@ public class CodeNDriveService extends InputMethodService {
         }
     };
 
-    // ---------------- CodeNDrive modes ----------------
-    // CODE: dictation passes through CodeText.codeSymbols — spoken
-    // symbol names always become glyphs. SPELL: dictation passes
-    // through CodeText.spell — spelled letters become the exact
-    // lowercase string. Mutually exclusive; both off = the inherited
-    // keyboard behavior, byte for byte. Modes affect dictation only;
-    // typed keys are untouched. State lives on the two mode keys
-    // (lit when on) and in the strip's resting text.
-    private boolean codeMode = false;
-    private boolean spellMode = false;
-    private Button codeButton;
-    private Button spellButton;
+    // ---------------- CodeNDrive dictation transforms ----------------
+    // v1.0.3 (James, 2026-11-11): there are no mode buttons anymore —
+    // "it should be automatically applied." Every voice result runs
+    // through CodeText.autoApply, the deterministic combined pass:
+    // spelled letter runs collapse to the exact lowercase string and
+    // spoken symbol names become glyphs, in one pass, no toggles.
+    // Typed keys are untouched.
 
     private static final String PREFS = "cnd_prefs";
 
@@ -445,7 +472,6 @@ public class CodeNDriveService extends InputMethodService {
             addRow(new String[]{"_","=","*",":",";","!","?","'","\"","BKSP"}, false);
             addBottomRow("ABC");
         }
-        addModeRow();
         refreshShiftLabels();
     }
 
@@ -525,64 +551,13 @@ public class CodeNDriveService extends InputMethodService {
         keysBox.addView(row);
     }
 
-    /** CodeNDrive mode row: two clearly labelled toggles under the key
-     *  rows, always visible. Active mode is lit green (CODE) or amber
-     *  (SPELL); the strip's resting text names the mode too. */
-    private void addModeRow() {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        codeButton = new Button(this);
-        styleKey(codeButton);
-        codeButton.setText("CODE");
-        codeButton.setTextSize(13);
-        codeButton.setOnClickListener(v -> onCodeModeKey());
-        row.addView(codeButton, new LinearLayout.LayoutParams(0, dp(40), 1f));
-        spellButton = new Button(this);
-        styleKey(spellButton);
-        spellButton.setText("SPELL");
-        spellButton.setTextSize(13);
-        spellButton.setOnClickListener(v -> onSpellModeKey());
-        row.addView(spellButton, new LinearLayout.LayoutParams(0, dp(40), 1f));
-        keysBox.addView(row);
-        refreshModeButtons();
-    }
-
-    private void onCodeModeKey() {
-        cancelCountdownOnTap();
-        codeMode = !codeMode;
-        if (codeMode) spellMode = false;
-        refreshModeButtons();
-        refreshRestingStrip();
-    }
-
-    private void onSpellModeKey() {
-        cancelCountdownOnTap();
-        spellMode = !spellMode;
-        if (spellMode) codeMode = false;
-        refreshModeButtons();
-        refreshRestingStrip();
-    }
-
-    private void refreshModeButtons() {
-        if (codeButton != null) {
-            codeButton.setBackgroundColor(codeMode
-                    ? Color.rgb(30, 110, 70) : Color.rgb(52, 56, 64));
-        }
-        if (spellButton != null) {
-            spellButton.setBackgroundColor(spellMode
-                    ? Color.rgb(140, 95, 20) : Color.rgb(52, 56, 64));
-        }
-    }
-
-    /** The strip's resting text: the active dictation mode, or blank.
-     *  Listening, the ClickSend countdown and error messages own the
-     *  strip while they run — this only sets what it returns to. */
+    /** The strip's resting text. Pre-1.0.3 this named the active
+     *  dictation mode; with the mode buttons gone (transforms apply
+     *  automatically) the resting strip is simply blank — listening,
+     *  ClickSend and error messages still own it while they run. */
     private void refreshRestingStrip() {
         if (stripStatus == null) return;
-        if (passwordField) { setStripStatus(""); return; }
-        if (codeMode) setStripStatus("CODE \u2014 symbols come out as glyphs");
-        else if (spellMode) setStripStatus("SPELL \u2014 say letters, get the exact word");
-        else setStripStatus("");
+        setStripStatus("");
     }
 
     private void styleKey(Button b) {
@@ -681,9 +656,13 @@ public class CodeNDriveService extends InputMethodService {
      *   1. performEditorAction(EditorInfo.actionId) when the editor set
      *      a custom action id (editors that expose send only that way).
      *   2. performEditorAction(imeOptions action) — SEND/GO/DONE/etc.
-     *   3. A raw KEYCODE_ENTER key event — compose boxes that declare
+     *   3. performEditorAction(IME_ACTION_SEND) explicitly (v1.0.3) —
+     *      for editors that listen for SEND specifically without
+     *      declaring it; skipped when a declared attempt already made
+     *      that same call.
+     *   4. A raw KEYCODE_ENTER key event — compose boxes that declare
      *      IME_ACTION_NONE/unspecified but send on the Enter key.
-     *   4. commitText("\n") — the old terminal fallback, kept for
+     *   5. commitText("\n") — the old terminal fallback, kept for
      *      plain/multiline editors where enter means newline.
      */
     private void performSendAction(InputConnection ic, EditorInfo info) {
@@ -698,6 +677,9 @@ public class CodeNDriveService extends InputMethodService {
                     break;
                 case SendPlan.ATTEMPT_IME_ACTION:
                     handled = ic.performEditorAction(imeAction);
+                    break;
+                case SendPlan.ATTEMPT_EDITOR_SEND:
+                    handled = ic.performEditorAction(EditorInfo.IME_ACTION_SEND);
                     break;
                 case SendPlan.ATTEMPT_KEY_EVENT: {
                     long t = SystemClock.uptimeMillis();
@@ -1418,6 +1400,16 @@ public class CodeNDriveService extends InputMethodService {
     }
 
     private void onClickTripleDetected() {
+        // v1.0.3: the send's InputConnection calls must run on the
+        // main thread — an editor may drop them from any other. (The
+        // detector listener already posts here; this guard makes the
+        // invariant local to the send itself, whoever calls it.)
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            ui.post(new Runnable() {
+                @Override public void run() { onClickTripleDetected(); }
+            });
+            return;
+        }
         // v1.0.2 (James's ruling): no countdown, no cancel window — the
         // triple IS the send, fired immediately through the shared
         // enter/send path. The confirmation beep sounds as it fires.
@@ -1455,8 +1447,46 @@ public class CodeNDriveService extends InputMethodService {
 
     // ---------------- voice ----------------
 
+    /** Recognizer intent with the v1.0.3 patience extras: ask for a
+     *  long minimum session and long silence tolerances (6-10s band).
+     *  The extras are hints — a recognizer may ignore them, which is
+     *  exactly why the auto-resume in VoiceListener exists. */
+    private Intent buildVoiceIntent() {
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 10000L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 8000L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 6000L);
+        return intent;
+    }
+
+    /** A timeout-type ending arrived. While the session is armed and
+     *  the consecutive-empty streak is under the cap, schedule the
+     *  restart (small backoff — a recognizer needs a beat after an
+     *  error before it will listen again) and return true: the
+     *  session continues, mic still lit, nothing committed. */
+    private boolean tryAutoResume() {
+        if (!dictationArmed) return false;
+        if (++emptyRestartCount > MAX_EMPTY_RESTARTS) return false;
+        ui.removeCallbacks(voiceRestart);
+        ui.postDelayed(voiceRestart, RESTART_BACKOFF_MS);
+        return true;
+    }
+
+    /** End the dictation session for real: user stop, final result,
+     *  real error, or the keyboard going away. */
+    private void disarmDictation() {
+        dictationArmed = false;
+        ui.removeCallbacks(voiceRestart);
+    }
+
     private void onMicKey() {
         if (listening) {
+            disarmDictation();
             stopListening();
             stopClickWatch();
             return;
@@ -1474,12 +1504,7 @@ public class CodeNDriveService extends InputMethodService {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
             recognizer.setRecognitionListener(new VoiceListener());
         }
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        Intent intent = buildVoiceIntent();
         try {
             // v1.0.2: the click recorder must never run while the
             // recognizer is live — stop any grace watch left over from
@@ -1488,11 +1513,14 @@ public class CodeNDriveService extends InputMethodService {
             stopClickWatch();
             recognizer.startListening(intent);
             listening = true;
+            dictationArmed = true;
+            emptyRestartCount = 0;
             if (micButton != null) micButton.setText("🔴");
             setStripStatus("Listening… tap 🎤 again to stop.");
         } catch (Exception e) {
             setStripStatus("Voice failed to start.");
             listening = false;
+            dictationArmed = false;
         }
     }
 
@@ -1504,7 +1532,10 @@ public class CodeNDriveService extends InputMethodService {
 
     private class VoiceListener implements RecognitionListener {
         @Override public void onReadyForSpeech(Bundle params) { }
-        @Override public void onBeginningOfSpeech() { }
+        @Override public void onBeginningOfSpeech() {
+            // Real speech breaks the consecutive-empty streak.
+            emptyRestartCount = 0;
+        }
         @Override public void onRmsChanged(float rmsdB) {
             if (rmsdB < rmsSessionMin) rmsSessionMin = rmsdB;
             if (rmsdB > rmsSessionMax) rmsSessionMax = rmsdB;
@@ -1512,6 +1543,15 @@ public class CodeNDriveService extends InputMethodService {
         @Override public void onBufferReceived(byte[] buffer) { }
         @Override public void onEndOfSpeech() { }
         @Override public void onError(int error) {
+            // v1.0.3: a timeout-type ending while armed resumes the
+            // session instead of ending it — nothing is committed,
+            // the mic stays lit, the user just keeps talking.
+            if ((error == SpeechRecognizer.ERROR_NO_MATCH
+                    || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+                    && tryAutoResume()) {
+                return;
+            }
+            disarmDictation();
             listening = false;
             if (micButton != null) micButton.setText("\ud83c\udfa4");
             stopClickWatch();
@@ -1525,37 +1565,36 @@ public class CodeNDriveService extends InputMethodService {
             }
         }
         @Override public void onResults(Bundle results) {
-            listening = false;
-            if (micButton != null) micButton.setText("🎤");
             ArrayList<String> texts = results != null
                     ? results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) : null;
+            // An EMPTY result is a timeout cut, not a final: resume
+            // while armed (v1.0.3). A non-empty result is FINAL — it
+            // falls through, commits, ends the session and arms the
+            // ClickSend grace, exactly as dictation always has.
+            if ((texts == null || texts.isEmpty()) && tryAutoResume()) {
+                return;
+            }
+            disarmDictation();
+            listening = false;
+            if (micButton != null) micButton.setText("🎤");
             if (texts != null && !texts.isEmpty()) {
                 String raw = texts.get(0);
                 // v3.1 field fix: re-read the layer toggles at the moment
                 // of correction, so the voice path never runs on stale
                 // toggle state captured at an earlier onStartInput.
                 loadPrefs();
-                String cleaned;
-                if (spellMode) {
-                    // SPELL: the letter pass IS the result — the exact
-                    // lowercase string, no correction pipeline, and no
-                    // trailing space (exactness is the whole point).
-                    cleaned = CodeText.spell(raw);
-                    commit(cleaned);
-                } else if (codeMode) {
-                    // CODE: spoken symbol names become glyphs, always.
-                    // The deterministic pass replaces the prose pipeline
-                    // for this result; modes off = inherited path below.
-                    cleaned = CodeText.codeSymbols(raw);
-                    commit(cleaned);
-                    if (!cleaned.endsWith(" ") && !cleaned.endsWith("\n")) commit(" ");
-                } else {
-                    cleaned = engine.correctVoice(raw);
-                    commit(cleaned);
-                    // Dictation flows sentence to sentence: add a trailing space
-                    // unless the text already ends with one.
-                    if (!cleaned.endsWith(" ") && !cleaned.endsWith("\n")) commit(" ");
-                }
+                // v1.0.3: the CodeNDrive transforms apply automatically
+                // to every voice result — no mode keys, no toggles.
+                // The deterministic combined pass IS the result: spell
+                // runs collapse and symbol names become glyphs in one
+                // pass (CodeText.autoApply). The inherited prose
+                // correction pipeline no longer sits on this path,
+                // exactly as the old mode passes replaced it.
+                String cleaned = CodeText.autoApply(raw);
+                commit(cleaned);
+                // Dictation flows sentence to sentence: add a trailing
+                // space unless the text already ends with one.
+                if (!cleaned.endsWith(" ") && !cleaned.endsWith("\n")) commit(" ");
                 // Voice results are final committed text by definition:
                 // observe exactly what was committed, then resync the
                 // snapshot so the delta observer cannot count it twice.
@@ -1579,10 +1618,9 @@ public class CodeNDriveService extends InputMethodService {
                     ? partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) : null;
             if (texts != null && !texts.isEmpty()) {
                 String p = texts.get(0);
-                // In a mode, show the mode's own output forming — the
-                // spelled letters / glyphs — not the raw recognizer text.
-                if (spellMode) p = "✍ " + CodeText.spell(p);
-                else if (codeMode) p = CodeText.codeSymbols(p);
+                // v1.0.3: show the auto-applied output forming — the
+                // collapsed spelling / glyphs — not the raw text.
+                p = CodeText.autoApply(p);
                 if (p.length() > 42) p = "…" + p.substring(p.length() - 42);
                 setStripStatus(p);
             }
@@ -1592,6 +1630,7 @@ public class CodeNDriveService extends InputMethodService {
 
     @Override
     public void onFinishInputView(boolean finishingInput) {
+        disarmDictation();
         stopClickWatch();
         // Commit boundary: keyboard is going away, field text is final.
         observeCommittedDelta();
@@ -1602,6 +1641,7 @@ public class CodeNDriveService extends InputMethodService {
 
     @Override
     public void onFinishInput() {
+        disarmDictation();
         stopClickWatch();
         observeCommittedDelta();
         super.onFinishInput();
@@ -1609,6 +1649,7 @@ public class CodeNDriveService extends InputMethodService {
 
     @Override
     public void onDestroy() {
+        disarmDictation();
         stopClickWatch();
         if (toneGen != null) {
             try { toneGen.release(); } catch (Exception ignored) { }

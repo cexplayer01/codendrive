@@ -10,39 +10,41 @@ when the surrounding words prove the change is right. CodeNDrive keeps
 that engine and adds the two things a speech recognizer will never do
 reliably on its own:
 
-## SPELL mode
+## Automatic — no modes, no buttons
 
-Tap **SPELL**, tap the mic, and spell the word: *"ess you pee ay bee ay
-ess ee"* comes out as `supabase` — the exact lowercase string, every
-time. No capitalization, no "helpful" substitution of a real word, no
-sentence-casing. Letter names, digits, and the identifier symbols
-(underscore, dash, dot) are recognized inline, so identifiers survive
-dictation intact. A token that isn't a letter is dropped, never
-guessed: deterministic beats helpful. While you spell, the strip shows
-the word forming, letter by letter.
+There are no mode keys. Every dictation result is passed through one
+deterministic combined transform, automatically:
 
-## CODE mode
+**Spelled runs collapse.** Spell a word and it comes out as the exact
+lowercase string, every time: *"ess you pee ay bee ay ess ee"* →
+`supabase`. No capitalization, no "helpful" substitution of a real
+word, no sentence-casing. Letter names, digits, and the identifier
+symbols (underscore, dash, dot) are recognized inline inside a spelled
+run, so identifiers survive dictation intact. A token that isn't a
+letter is dropped from the run, never guessed: deterministic beats
+helpful. While you spell, the strip shows the word forming.
 
-Tap **CODE** and spoken symbol names **always** become glyphs, never
-literal words: underscore → `_`, open paren → `(`, fat arrow → `=>`,
-backslash → `\`, at sign → `@`, backtick → `` ` `` — the whole table,
-applied by a fixed deterministic pass with one fixed spacing rule
-(glyphs hug their neighbours; letter and number runs hug each other;
-words stay spaced). *"open paren ex plus one close paren"* comes out as
-`(x+1)`. Say "space", "tab" or "new line" and the whitespace lands
-exactly where you said it.
+**Symbol names become glyphs.** Spoken symbol names come out as
+glyphs, never literal words: underscore → `_`, open paren → `(`,
+fat arrow → `=>`, backslash → `\`, at sign → `@`, backtick → `` ` `` —
+the whole table, applied by a fixed deterministic pass with one fixed
+spacing rule (glyphs hug their neighbours; letter and number runs hug
+each other; words stay spaced). *"open paren ex plus one close paren"*
+comes out as `(x+1)`. Say "space", "tab" or "new line" and the
+whitespace lands exactly where you said it.
 
-Both modes are toggled from two labelled keys on the keyboard itself —
-no settings spelunking — the active key stays lit, the strip names the
-active mode, and with both modes off the keyboard behaves exactly like
-its parent.
+Ordinary prose is untouched: a spelled run or a symbol name triggers
+the transform, anything else passes through exactly as the recognizer
+heard it — *"hello world this is a test"* comes out as `hello world
+this is a test`.
 
 ## ClickSend (inherited)
 
 Dictate a message, then click your tongue **three times**: the
-keyboard beeps, shows a two-second countdown on the strip (one more
-click, or any tap, cancels), and sends — completely hands-free. The
-detector is armed only while dictating; it is calibrated so that
+keyboard sends immediately and beeps as it fires — completely
+hands-free. There is no countdown and no cancel window: a false
+triple is an instant send, and that's the accepted trade. The
+detector is armed only around dictation; it is calibrated so that
 ordinary speech and stray mouth noise cannot fire it.
 
 ## Privacy
@@ -82,10 +84,10 @@ Needs JDK 17 and the Android SDK (platform android-36, build-tools
 KEYSTORE_PASS=yourpass ./build.sh 1.0.0
 ```
 
-The APK lands in `out/`. Host-side tests for the two deterministic
-passes live in `tests/CodeTextBattery.java` (plain `main()`, no
-dependencies): every symbol in the table and every spelling rule is
-covered by an exact-match case.
+The APK lands in `out/`. Host-side tests for the deterministic
+transform live in `tests/CodeTextBattery.java` (plain `main()`, no
+dependencies): every symbol in the table, every spelling rule, and a
+set of prose pass-through cases are covered by exact-match cases.
 
 ## License
 

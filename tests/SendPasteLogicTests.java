@@ -46,17 +46,21 @@ public class SendPasteLogicTests {
 
     public static void main(String[] args) {
         final int A = SendPlan.ATTEMPT_ACTION_ID, I = SendPlan.ATTEMPT_IME_ACTION,
+                S = SendPlan.ATTEMPT_EDITOR_SEND,
                 K = SendPlan.ATTEMPT_KEY_EVENT, N = SendPlan.ATTEMPT_NEWLINE;
 
-        // ---- SendPlan ----
+        // ---- SendPlan (v3.4.3: explicit SEND attempt between the
+        // declared actions and the key event, deduped when a declared
+        // attempt already performed performEditorAction(SEND)) ----
         plan("declared SEND only", 0, SEND, new int[]{I, K, N});
-        plan("declared DONE only", 0, DONE, new int[]{I, K, N});
-        plan("nothing declared (Muse-app shape)", 0, NONE, new int[]{K, N});
-        plan("unspecified", 0, UNSPECIFIED, new int[]{K, N});
-        plan("custom actionId only", 0x1234, NONE, new int[]{A, K, N});
+        plan("declared DONE only", 0, DONE, new int[]{I, S, K, N});
+        plan("nothing declared (Muse-app shape)", 0, NONE, new int[]{S, K, N});
+        plan("unspecified", 0, UNSPECIFIED, new int[]{S, K, N});
+        plan("custom actionId only", 0x1234, NONE, new int[]{A, S, K, N});
         plan("actionId + SEND", 0x1234, SEND, new int[]{A, I, K, N});
         plan("actionId == imeAction dedupes", SEND, SEND, new int[]{A, K, N});
-        plan("no EditorInfo at all", 0, 0, new int[]{K, N});
+        plan("actionId is SEND alone", SEND, NONE, new int[]{A, K, N});
+        plan("no EditorInfo at all", 0, 0, new int[]{S, K, N});
 
         // ---- ClipScan.descHasImage ----
         check("desc image/png", ClipScan.descHasImage(new String[]{"image/png"}), true);
