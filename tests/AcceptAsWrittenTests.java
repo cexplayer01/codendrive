@@ -18,6 +18,13 @@ import java.util.List;
  * segment corrections. Plain main() harness, same style as
  * SendPasteLogicTests / CodeTextBattery.
  *
+ * v1.0.5: the engine-driven snap cases are re-pinned from
+ * "replied"->"Replit" to "larval"->"Laravel" — the replied garble is
+ * FIXED in the engine (garble registry entry 1) and is pinned as
+ * protected in the GARBLE section below. The synthetic forWord cases
+ * still use the literal "replied"/"Replit" pair (pure policy calls,
+ * no engine involved), and the decode cases are unchanged.
+ *
  * Run: javac -encoding UTF-8 -d /tmp/awt \
  *        app/src/com/james/codendrive/AcceptAsWritten.java \
  *        $(find engine -name '*.java') \
@@ -82,59 +89,65 @@ public class AcceptAsWrittenTests {
                 "Replit");
 
         // ---------- typed path, end to end through the real engine ----------
-        // The service's personal layer is engine.correctToken; this is
-        // the exact "replied" -> "Replit" snap James hit on this
-        // keyboard, and the layer v1.0.4 wires the undo slot into.
-        String typedApplied = e.correctToken("replied", null);
-        checkStr("TYPED engine snaps replied (precondition)",
-                typedApplied, "Replit");
+        // The service's personal layer is engine.correctToken, and the
+        // layer v1.0.4 wires the undo slot into.
+        // v1.0.5 RE-PIN: this case originally ran on the exact
+        // "replied" -> "Replit" snap James hit on this keyboard — that
+        // garble is now fixed in the engine (GARBLE section below), so
+        // the escape mechanics re-pin on "larval" -> "Laravel", a real
+        // word that still fuzzy-snaps (probed 2026-11-14).
+        String typedApplied = e.correctToken("larval", null);
+        checkStr("TYPED engine snaps larval (precondition)",
+                typedApplied, "Laravel");
         AcceptAsWritten.Option t =
-                AcceptAsWritten.forWord("replied", typedApplied);
+                AcceptAsWritten.forWord("larval", typedApplied);
         check("TYPED as-written option offered for the snap", t != null);
         checkStr("TYPED accepting it commits the literal word",
-                AcceptAsWritten.apply(typedApplied, t), "replied");
+                AcceptAsWritten.apply(typedApplied, t), "larval");
         check("TYPED a word the engine leaves alone offers nothing",
                 AcceptAsWritten.forWord("buyer", e.correctToken("buyer", null))
                         == null);
 
         // ---------- segment: one snap ----------
-        String raw1 = "he replied to the buyer";
+        // (v1.0.5 re-pin: "the larval stage", was "he replied to the
+        // buyer" before the replied garble was fixed in the engine.)
+        String raw1 = "the larval stage";
         String cor1 = e.correctVoice(raw1);
         checkStr("SEGMENT engine output (precondition)",
-                cor1, "He Replit to the buyer");
+                cor1, "The Laravel stage");
         List<AcceptAsWritten.Option> o1 = AcceptAsWritten.forSegment(raw1, cor1);
         checkInt("SEGMENT exactly one option (sentence-start case is not one)",
                 o1.size(), 1);
         checkStr("SEGMENT option is the literal word",
-                o1.isEmpty() ? null : o1.get(0).original, "replied");
+                o1.isEmpty() ? null : o1.get(0).original, "larval");
         checkStr("SEGMENT accepting restores the segment byte-exact",
                 AcceptAsWritten.apply(cor1, o1.get(0)),
-                "He replied to the buyer");
+                "The larval stage");
 
         // ---------- segment: two different changes, each its own option ----------
         // Unchanged tokens ("to", "today") anchor the alignment, so
         // the snap and the decode phrase form separate regions.
-        String raw2 = "i replied to net lafaye today";
+        String raw2 = "the larval stage for net lafaye today";
         String cor2 = e.correctVoice(raw2);
         checkStr("SEGMENT decode+snap output (precondition)",
-                cor2, "I Replit to Netlify today");
+                cor2, "The Laravel stage for Netlify today");
         List<AcceptAsWritten.Option> o2 = AcceptAsWritten.forSegment(raw2, cor2);
         checkInt("SEGMENT snap + decode phrase = two options", o2.size(), 2);
         checkStr("SEGMENT first option is the snapped word",
-                o2.size() > 0 ? o2.get(0).original : null, "replied");
+                o2.size() > 0 ? o2.get(0).original : null, "larval");
         checkStr("SEGMENT second option is the whole spoken phrase",
                 o2.size() > 1 ? o2.get(1).original : null, "net lafaye");
-        // (Sentence-start "i" -> "I" is a case-only change: by the
+        // (Sentence-start "the" -> "The" is a case-only change: by the
         // policy's rule it is never offered, so it stays capitalized.)
         checkStr("SEGMENT accepting both restores every snapped token",
-                acceptAll(raw2, cor2), "I replied to net lafaye today");
+                acceptAll(raw2, cor2), "The larval stage for net lafaye today");
 
         // A segment whose EVERY token changed has no anchors: one
         // whole-segment option, accepting restores the raw byte-exact.
-        String raw2b = "net lafaye replied";
+        String raw2b = "net lafaye larval";
         String cor2b = e.correctVoice(raw2b);
         checkStr("SEGMENT fully-changed output (precondition)",
-                cor2b, "Netlify Replit");
+                cor2b, "Netlify Laravel");
         List<AcceptAsWritten.Option> o2b =
                 AcceptAsWritten.forSegment(raw2b, cor2b);
         checkInt("SEGMENT fully-changed segment = one option", o2b.size(), 1);
@@ -159,27 +172,27 @@ public class AcceptAsWrittenTests {
                 acceptAll(raw3, cor3), "I use super base and deep seek");
 
         // ---------- segment: same word snapped twice ----------
-        String raw4 = "replied and replied";
+        String raw4 = "larval and larval";
         String cor4 = e.correctVoice(raw4);
         checkStr("SEGMENT repeated snap output (precondition)",
-                cor4, "Replit and Replit");
+                cor4, "Laravel and Laravel");
         List<AcceptAsWritten.Option> o4 = AcceptAsWritten.forSegment(raw4, cor4);
         checkInt("SEGMENT each snapped instance gets its own option",
                 o4.size(), 2);
         checkStr("SEGMENT accepting the first leaves the second snapped",
-                AcceptAsWritten.apply(cor4, o4.get(0)), "replied and Replit");
+                AcceptAsWritten.apply(cor4, o4.get(0)), "larval and Laravel");
         checkStr("SEGMENT accepting all returns the raw segment",
                 acceptAll(raw4, cor4), raw4);
 
         // ---------- segment: punctuation outside the span survives ----------
-        String raw5 = "i replied, thanks";
+        String raw5 = "i larval, thanks";
         String cor5 = e.correctVoice(raw5);
         checkStr("SEGMENT punctuation output (precondition)",
-                cor5, "I Replit, thanks");
+                cor5, "I Laravel, thanks");
         List<AcceptAsWritten.Option> o5 = AcceptAsWritten.forSegment(raw5, cor5);
         checkInt("SEGMENT punctuated snap = one option", o5.size(), 1);
         checkStr("SEGMENT accepting keeps the comma exactly",
-                AcceptAsWritten.apply(cor5, o5.get(0)), "I replied, thanks");
+                AcceptAsWritten.apply(cor5, o5.get(0)), "I larval, thanks");
 
         // ---------- segment: no snap -> no option ----------
         String raw6 = "the quick brown fox";
@@ -195,10 +208,10 @@ public class AcceptAsWrittenTests {
                         .isEmpty());
 
         // ---------- the strip cap: first MAX_OPTIONS regions win ----------
-        String raw7 = "replied replied replied replied";
+        String raw7 = "larval larval larval larval";
         String cor7 = e.correctVoice(raw7);
         checkStr("SEGMENT four snaps output (precondition)",
-                cor7, "Replit Replit Replit Replit");
+                cor7, "Laravel Laravel Laravel Laravel");
         checkInt("SEGMENT options capped at the strip size",
                 AcceptAsWritten.forSegment(raw7, cor7).size(),
                 AcceptAsWritten.MAX_OPTIONS);
@@ -220,7 +233,7 @@ public class AcceptAsWrittenTests {
         // corrected segment lands (with the trailing space the commit
         // rule adds), one as-written tap swaps the snapped token in
         // the committed text for the literal original, byte-exact.
-        String rawF = "he replied to the buyer";
+        String rawF = "the larval stage";
         String cleanedF = e.correctVoice(rawF);
         String committedF = cleanedF + " ";
         List<AcceptAsWritten.Option> oF =
@@ -228,9 +241,51 @@ public class AcceptAsWrittenTests {
         checkInt("FLOW one option offered after the correction", oF.size(), 1);
         String restoredF = AcceptAsWritten.apply(cleanedF, oF.get(0)) + " ";
         checkStr("FLOW tap restores the literal in the committed text",
-                restoredF, "He replied to the buyer ");
+                restoredF, "The larval stage ");
         check("FLOW restored text differs from committed only at the snap",
-                committedF.startsWith("He Replit") && restoredF.contains("replied"));
+                committedF.startsWith("The Laravel") && restoredF.contains("larval"));
+
+        // ---------- GARBLE registry entry 1: replied/replies protected ----------
+        // James's standing rule (2026-11-14): known garbles die in the
+        // engine. "replied"/"replies" used to fuzzy-snap to "Replit" in
+        // every entry point; the protected-real-words set now refuses
+        // the snap. Sentence-start capitalization is pre-existing
+        // engine behavior (unchanged): a lone typed/dictated "replied"
+        // comes out "Replied" — capitalized, never "Replit".
+        checkStr("GARBLE token replied stays replied",
+                e.correctToken("replied", null), "replied");
+        checkStr("GARBLE token replies stays replies",
+                e.correctToken("replies", null), "replies");
+        checkStr("GARBLE typed sentence keeps replied",
+                e.correctTyped("he replied to the buyer"),
+                "He replied to the buyer");
+        checkStr("GARBLE voice sentence keeps replied",
+                e.correctVoice("he replied to the buyer"),
+                "He replied to the buyer");
+        checkStr("GARBLE voice sentence keeps replies",
+                e.correctVoice("she replies fast"), "She replies fast");
+        checkStr("GARBLE typed lone replied is sentence-cased, not snapped",
+                e.correctTyped("replied"), "Replied");
+        checkStr("GARBLE voice lone replies is sentence-cased, not snapped",
+                e.correctVoice("replies"), "Replies");
+        check("GARBLE snapWord refuses replied",
+                e.snapWord("replied") == null);
+        check("GARBLE snapWord refuses replies",
+                e.snapWord("replies") == null);
+        check("GARBLE reply never snapped (recorded 2026-11-14)",
+                e.snapWord("reply") == null);
+        check("GARBLE replying never snapped (recorded 2026-11-14)",
+                e.snapWord("replying") == null);
+        checkStr("GARBLE brand intent: token replit still canonicalizes",
+                e.correctToken("replit", null), "Replit");
+        checkStr("GARBLE brand intent: voice replit still canonicalizes",
+                e.correctVoice("i use replit for code"),
+                "I use Replit for code");
+        checkStr("GARBLE phrase decode unchanged: super base",
+                e.correctVoice("super base"), "Supabase");
+        check("GARBLE protected word needs no as-written option",
+                AcceptAsWritten.forWord("replied",
+                        e.correctToken("replied", null)) == null);
 
         System.out.println("----------------------------------------");
         System.out.println("AcceptAsWrittenTests: " + pass + " PASS, " + fail + " FAIL");

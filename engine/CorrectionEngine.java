@@ -296,6 +296,25 @@ public final class CorrectionEngine {
         // sit one edit from common words; never snap them.
         "hand", "vegan", "rose"));
 
+    /**
+     * Protected real words (garble registry: ~/workspace/reference/
+     * keyboard-garbles.md). Ordinary English words that sit within
+     * fuzzy-snap distance of a lexicon entry and must never be snapped
+     * into it. Consulted before any snap-to-brand is applied, in every
+     * entry point (typed, voice, personal layer): snapWord refuses
+     * them and correctToken returns them untouched. James's standing
+     * rule (2026-11-14): known garbles die in the engine; the
+     * accept-as-written escape stays for garbles not yet recognized.
+     * Entry 1: "replied"/"replies" fuzzy-snapped to "Replit"
+     * (edit distance 2, similarity 0.714). "reply"/"replying" do NOT
+     * snap (probed 2026-11-14) and are deliberately not listed.
+     * Genuine brand inputs are unaffected: "replit" still canonicalizes
+     * to "Replit" via the exact lexicon path, which this set never
+     * blocks (no protected word is a lexicon key).
+     */
+    static final Set<String> PROTECTED_REAL_WORDS = new HashSet<>(Arrays.asList(
+        "replied", "replies"));
+
     private static final Map<String, String> LEXICON_BY_LOWER = new HashMap<>();
     static {
         for (String e : LEXICON) LEXICON_BY_LOWER.put(e.toLowerCase(Locale.US), e);
@@ -398,6 +417,9 @@ public final class CorrectionEngine {
             }
         }
         if (!snapOn) return token;
+        // Garble registry: a protected real word is never snap-to-brand
+        // material, in any entry point (typed, voice, personal layer).
+        if (PROTECTED_REAL_WORDS.contains(lower)) return token;
         String cased = CASING.get(lower);
         if (cased != null) return lead + cased + trail;
         String exact = LEXICON_BY_LOWER.get(lower);
@@ -417,6 +439,8 @@ public final class CorrectionEngine {
         String lower = word.toLowerCase(Locale.US);
         if (lower.length() < 4) return null;
         if (COMMON.contains(lower)) return null;
+        // Garble registry: protected real words never fuzzy-snap.
+        if (PROTECTED_REAL_WORDS.contains(lower)) return null;
         if (LEXICON_BY_LOWER.containsKey(lower)) return LEXICON_BY_LOWER.get(lower);
         String best = null;
         int bestDist = Integer.MAX_VALUE;
