@@ -100,6 +100,22 @@ public class CodeNDriveService extends InputMethodService {
     // occurrence of the same word.
     private String suppressTypedWord = null;
 
+    // ---------------- v1.0.4: accept-as-written state ----------------
+    //
+    // James's ruling (2026-11-14): a word close to a snap target must
+    // offer an accept-as-written option. The policy lives in
+    // AcceptAsWritten; the service only wires it to the strip.
+    //
+    // Typed path: boundaryFromPersonal records which correction layer
+    // produced the boundary change, so an undo pick arms the matching
+    // one-shot suppression. suppressPersonalWord mirrors
+    // suppressTypedWord for the personal layer (correctToken): set
+    // when the user undoes a personal-layer change, consumed at the
+    // next word boundary whether it matched or not, and when it
+    // matches that one restored instance is left alone.
+    private boolean boundaryFromPersonal = false;
+    private String suppressPersonalWord = null;
+
     // ---------------- v3.3 WS3: clipboard panel state ----------------
     private Button clipboardButton;
     private boolean clipboardPanelOpen = false;
@@ -369,6 +385,7 @@ public class CodeNDriveService extends InputMethodService {
         // a screenshot/copy taken just before opening is already cached.
         clearBoundarySuggestions();
         suppressTypedWord = null;
+        suppressPersonalWord = null;
         if (clipboardPanelOpen) { clipboardPanelOpen = false; buildKeys(); }
         refreshClipboardCache();
         refreshShiftLabels();
@@ -812,6 +829,7 @@ public class CodeNDriveService extends InputMethodService {
         boundaryWord = null;
         boundaryOriginal = null;
         boundaryIsUndo = false;
+        boundaryFromPersonal = false;
         boundarySuggestions.clear();
     }
 
@@ -837,6 +855,8 @@ public class CodeNDriveService extends InputMethodService {
      *
      * v3.3 WS2 order of authority:
      *   1. Personal layer — engine.correctToken runs FIRST and wins.
+     *      (v1.0.4: its change now also sets the undo state below, so
+     *      the original word is strip slot 0, exactly like layer 2.)
      *   2. Typed layer — engine.correctTyped(word, sentenceStart), only
      *      when the personal layer made no change. A change is applied
      *      and the ORIGINAL word becomes strip slot 0 (undo: tapping it
@@ -859,12 +879,35 @@ public class CodeNDriveService extends InputMethodService {
         if (start == end) return;
         String word = s.substring(start, end);
         if (word.length() < 2) return;
+        // v1.0.4 one-shot as-written suppression for the personal
+        // layer: consumed at this boundary either way (mirrors the
+        // typed flag below). When it matches, the restored word is
+        // left alone for this one instance.
+        if (suppressPersonalWord != null) {
+            boolean suppressedInstance = suppressPersonalWord.equals(word);
+            suppressPersonalWord = null;
+            if (suppressedInstance) return;
+        }
         // 1. Personal layer first, and it wins outright.
         String fixed = engine.correctToken(word, null);
-        if (fixed != null && !fixed.equals(word)) {
+        AcceptAsWritten.Option personalOption =
+                AcceptAsWritten.forWord(word, fixed);
+        if (personalOption != null) {
             suppressTypedWord = null; // a boundary elsewhere consumes the flag
             ic.deleteSurroundingText(word.length(), 0);
             ic.commitText(fixed, 1);
+            // v1.0.4: a personal-layer snap/decode now gets the same
+            // as-written undo slot the typed layer has always had —
+            // slot 0 is the original word (this is the layer that
+            // turned James's "replied" into "Replit"). Tapping it
+            // restores the literal and arms suppressPersonalWord so
+            // the restored instance is not immediately re-snapped.
+            boundaryWord = fixed;
+            boundaryOriginal = personalOption.original;
+            boundaryIsUndo = true;
+            boundaryFromPersonal = true;
+            boundarySuggestions.clear();
+            boundarySuggestions.add(personalOption.original); // slot 0 = original = undo
             return;
         }
         // One-shot undo suppression: consumed at this boundary either way.
@@ -882,6 +925,7 @@ public class CodeNDriveService extends InputMethodService {
             boundaryWord = typedFixed;
             boundaryOriginal = word;
             boundaryIsUndo = true;
+            boundaryFromPersonal = false;
             boundarySuggestions.clear();
             boundarySuggestions.add(word); // slot 0 = original = undo
             return;
@@ -974,6 +1018,7 @@ public class CodeNDriveService extends InputMethodService {
     private void pickBoundarySuggestion(int idx) {
         String replacement = boundarySuggestions.get(idx);
         boolean isUndoPick = boundaryIsUndo && replacement.equals(boundaryOriginal);
+        boolean fromPersonal = boundaryFromPersonal;
         String expectedInField = boundaryWord;
         String restoredOriginal = boundaryOriginal;
         InputConnection ic = getCurrentInputConnection();
@@ -997,7 +1042,12 @@ public class CodeNDriveService extends InputMethodService {
         }
         ic.deleteSurroundingText(end - start, 0);
         ic.commitText(replacement + (suffix.isEmpty() ? " " : suffix), 1);
-        if (isUndoPick) suppressTypedWord = restoredOriginal;
+        if (isUndoPick) {
+            // v1.0.4: arm the suppression of the layer that made the
+            // change, so the restored instance is not re-corrected.
+            if (fromPersonal) suppressPersonalWord = restoredOriginal;
+            else suppressTypedWord = restoredOriginal;
+        }
         afterCommit();
     }
 
